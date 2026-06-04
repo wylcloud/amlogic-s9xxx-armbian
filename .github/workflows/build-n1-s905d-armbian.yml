@@ -1,10 +1,10 @@
-name: Build N1 s905d Armbian Bookworm from official image
+name: Build N1 s905d Armbian image
 
 on:
   workflow_dispatch:
     inputs:
       armbian_url:
-        description: "Official Armbian Odroid N2 Bookworm image URL, .img.xz"
+        description: "Official Armbian Odroid N2 image URL, .img.xz"
         required: true
         type: string
       armbian_kernel:
@@ -28,6 +28,7 @@ permissions:
 
 env:
   TZ: Asia/Shanghai
+  BOARD: s905d
 
 jobs:
   build:
@@ -46,6 +47,7 @@ jobs:
           sudo apt-get install -y $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
           sudo timedatectl set-timezone "${TZ}"
           mkdir -p build/output/images
+          mkdir -p final-output
 
       - name: Rebuild Armbian for Phicomm N1 s905d
         uses: ophub/amlogic-s9xxx-armbian@main
@@ -61,10 +63,47 @@ jobs:
           armbian_size: 512/2560
           builder_name: wylcloud
 
-      - name: Upload image artifact
+      - name: Collect final N1 image only
+        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        run: |
+          set -e
+
+          echo "PACKAGED_OUTPUTPATH=${PACKAGED_OUTPUTPATH}"
+          echo "List all generated files:"
+          ls -lh "${PACKAGED_OUTPUTPATH}"
+
+          mkdir -p final-output
+
+          FINAL_IMAGE_COUNT="$(find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" | wc -l)"
+
+          if [ "${FINAL_IMAGE_COUNT}" -eq 0 ]; then
+            echo "ERROR: No final amlogic_s905d image found."
+            exit 1
+          fi
+
+          if [ "${FINAL_IMAGE_COUNT}" -gt 1 ]; then
+            echo "ERROR: More than one final amlogic_s905d image found."
+            find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" -print
+            exit 1
+          fi
+
+          FINAL_IMAGE="$(find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" | head -n 1)"
+
+          echo "Final image:"
+          echo "${FINAL_IMAGE}"
+
+          cp -f "${FINAL_IMAGE}" final-output/
+
+          cd final-output
+          sha256sum "$(basename "${FINAL_IMAGE}")" > "$(basename "${FINAL_IMAGE}").sha256"
+
+          echo "Final artifact files:"
+          ls -lh
+
+      - name: Upload final N1 image artifact
         if: ${{ env.PACKAGED_STATUS == 'success' }}
         uses: actions/upload-artifact@v4
         with:
-          name: n1-s905d-armbian-bookworm
-          path: ${{ env.PACKAGED_OUTPUTPATH }}/*
+          name: n1-s905d-armbian-final
+          path: final-output/*
           if-no-files-found: error
