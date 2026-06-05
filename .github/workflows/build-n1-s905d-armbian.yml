@@ -4,11 +4,12 @@ on:
   workflow_dispatch:
     inputs:
       armbian_url:
-        description: "Official Armbian Odroid N2 image URL, .img.xz"
+        description: "Official Armbian Odroid N2 image URL, for example: https://xxx/Armbian_xxx_Odroidn2_xxx.img.xz"
         required: true
         type: string
+
       armbian_kernel:
-        description: "Kernel series for N1/s905d"
+        description: "Kernel series for Phicomm N1 / s905d"
         required: true
         default: "6.12.y"
         type: choice
@@ -17,8 +18,15 @@ on:
           - 6.6.y
           - 6.1.y
           - 5.15.y
+
       auto_kernel:
         description: "Auto use latest kernel in selected series"
+        required: true
+        default: true
+        type: boolean
+
+      remove_software_center:
+        description: "Remove ophub armbian-software center from final image"
         required: true
         default: true
         type: boolean
@@ -36,18 +44,24 @@ jobs:
     runs-on: ubuntu-24.04
 
     steps:
-      - name: Checkout
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Initialize build environment
         env:
           DEBIAN_FRONTEND: noninteractive
         run: |
+          set -e
+
           sudo apt-get update -y
           sudo apt-get install -y $(curl -fsSL https://ophub.org/ubuntu2404-build-armbian-depends)
+
           sudo timedatectl set-timezone "${TZ}"
+
           mkdir -p build/output/images
           mkdir -p final-output
+          mkdir -p workdir
+          mkdir -p mnt-root
 
       - name: Rebuild Armbian for Phicomm N1 s905d
         uses: ophub/amlogic-s9xxx-armbian@main
@@ -64,12 +78,12 @@ jobs:
           builder_name: wylcloud
 
       - name: Collect final N1 image only
-        if: ${{ env.PACKAGED_STATUS == 'success' }}
+        if: ${{ env.PACKAGED_STATUS == 'success' && inputs.remove_software_center == false }}
         run: |
-          set -e
+          set -euo pipefail
 
           echo "PACKAGED_OUTPUTPATH=${PACKAGED_OUTPUTPATH}"
-          echo "List all generated files:"
+          echo "All generated files:"
           ls -lh "${PACKAGED_OUTPUTPATH}"
 
           mkdir -p final-output
@@ -89,13 +103,112 @@ jobs:
 
           FINAL_IMAGE="$(find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" | head -n 1)"
 
-          echo "Final image:"
+          echo "Final N1 image:"
           echo "${FINAL_IMAGE}"
 
           cp -f "${FINAL_IMAGE}" final-output/
 
           cd final-output
           sha256sum "$(basename "${FINAL_IMAGE}")" > "$(basename "${FINAL_IMAGE}").sha256"
+
+          echo "Final artifact files:"
+          ls -lh
+
+      - name: Remove armbian-software and collect final N1 image
+        if: ${{ env.PACKAGED_STATUS == 'success' && inputs.remove_software_center == true }}
+        run: |
+          set -euo pipefail
+
+          echo "PACKAGED_OUTPUTPATH=${PACKAGED_OUTPUTPATH}"
+          echo "All generated files:"
+          ls -lh "${PACKAGED_OUTPUTPATH}"
+
+          mkdir -p final-output
+          mkdir -p workdir
+          mkdir -p mnt-root
+
+          FINAL_IMAGE_COUNT="$(find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" | wc -l)"
+
+          if [ "${FINAL_IMAGE_COUNT}" -eq 0 ]; then
+            echo "ERROR: No final amlogic_s905d image found."
+            exit 1
+          fi
+
+          if [ "${FINAL_IMAGE_COUNT}" -gt 1 ]; then
+            echo "ERROR: More than one final amlogic_s905d image found."
+            find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" -print
+            exit 1
+          fi
+
+          FINAL_GZ="$(find "${PACKAGED_OUTPUTPATH}" -maxdepth 1 -type f -name "Armbian_*_amlogic_s905d_*.img.gz" | head -n 1)"
+
+          echo "Final N1 image gzip:"
+          echo "${FINAL_GZ}"
+
+          cp -f "${FINAL_GZ}" workdir/original.img.gz
+
+          echo "Decompress final image..."
+          gzip -dc workdir/original.img.gz > workdir/armbian-clean.img
+
+          LOOP="$(sudo losetup -Pf --show workdir/armbian-clean.img)"
+          echo "Loop device: ${LOOP}"
+
+          cleanup() {
+            set +e
+            sudo umount mnt-root 2>/dev/null || true
+            sudo losetup -d "${LOOP}" 2>/dev/null || true
+          }
+          trap cleanup EXIT
+
+          sleep 2
+
+          echo "Loop partitions:"
+          lsblk "${LOOP}"
+
+          ROOT_PART="$(lsblk -lnpo NAME,FSTYPE "${LOOP}" | awk '$2=="ext4" {print $1; exit}')"
+
+          if [ -z "${ROOT_PART}" ]; then
+            echo "ERROR: Cannot find ext4 root partition."
+            exit 1
+          fi
+
+          echo "Root partition: ${ROOT_PART}"
+
+          sudo mount "${ROOT_PART}" mnt-root
+
+          echo "Remove ophub armbian-software center only..."
+
+          sudo rm -f mnt-root/usr/sbin/armbian-software
+          sudo rm -f mnt-root/usr/bin/armbian-software
+          sudo rm -f mnt-root/usr/local/bin/armbian-software
+
+          sudo rm -rf mnt-root/usr/share/ophub/armbian-software
+          sudo rm -rf mnt-root/etc/ophub/armbian-software
+          sudo rm -rf mnt-root/opt/armbian-software
+
+          echo "Search remaining armbian-software files:"
+          sudo find mnt-root \
+            -xdev \
+            \( -name "*armbian-software*" -o -path "*/armbian-software/*" \) \
+            -print 2>/dev/null || true
+
+          echo "Keep other ophub system tools, such as armbian-install, armbian-update, armbian-ddbr."
+
+          sync
+
+          sudo umount mnt-root
+          sudo losetup -d "${LOOP}"
+          trap - EXIT
+
+          echo "Compress cleaned image..."
+          gzip -9 workdir/armbian-clean.img
+
+          CLEAN_NAME="$(basename "${FINAL_GZ}" .img.gz)-clean.img.gz"
+
+          mv workdir/armbian-clean.img.gz "final-output/${CLEAN_NAME}"
+
+          cd final-output
+          sha256sum "${CLEAN_NAME}" > "${CLEAN_NAME}.sha256"
 
           echo "Final artifact files:"
           ls -lh
